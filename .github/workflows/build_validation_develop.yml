@@ -1,0 +1,159 @@
+---
+name: Build Validation
+
+on: # yamllint disable-line rule:truthy
+  pull_request:
+    branches:
+      - main
+      - "feature/**"
+
+# for each ref (branch/pr) run just the most recent,
+# cancel other pending/running ones
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build_devcontainer:
+    name: Build devcontainer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            devcontainer:
+              - '.devcontainer/**'
+              - '.github/workflows/build_validation_develop.yml'
+
+      - name: Build deployment devcontainer
+        if: ${{ steps.filter.outputs.devcontainer == 'true' }}
+        run: |
+          docker build --build-arg INTERACTIVE=true \
+            --tag azuretre-deployment:validation \
+            --file .devcontainer/Dockerfile .
+
+      - name: Verify installed release and tools
+        if: ${{ steps.filter.outputs.devcontainer == 'true' }}
+        run: |
+          expected_version=$(grep -oP '(?<="UPSTREAM_REPO_VERSION": ")[^"]*' .devcontainer/devcontainer.json)
+          docker run --rm --network none \
+            --env EXPECTED_VERSION="${expected_version}" \
+            --entrypoint /bin/bash azuretre-deployment:validation -c '
+              set -euo pipefail
+              test "$(cat "${AZURETRE_HOME}/version.txt")" = "${EXPECTED_VERSION}"
+              test "$(cat "${AZURETRE_HOME}/repository.txt")" = "microsoft/AzureTRE"
+              test -f "${AZURETRE_HOME}/config.sample.yaml"
+              tre --help > /dev/null
+              porter version
+            '
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          # Full git history is needed to get a proper list of
+          # changed files within `super-linter`
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            ci_cleanup:
+              - '.github/scripts/clean_ci_validation_envs.sh'
+              - '.github/tests/**'
+              - '.github/workflows/build_validation_develop.yml'
+              - '.github/workflows/clean_validation_envs.yml'
+
+      - name: Test CI environment cleanup
+        if: ${{ steps.filter.outputs.ci_cleanup == 'true' }}
+        run: python3 -m unittest discover -s .github/tests -v
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.14.3"
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      # find all terraform folders and run validate to catch
+      # configuration errors
+      - name: Terraform validation
+        run: |
+          find . -type d -name 'terraform' -not -path '*cnab*' -print0 \
+          | xargs -0 -I{} sh -c 'echo "***** Validating: {} *****"; \
+          terraform -chdir={} init -backend=false; terraform -chdir={} validate'
+
+      - name: Lint code base
+        # the slim image is 2GB smaller and we don't use the extra stuff
+        # Moved this after the Terraform checks above due something similar to this issue:
+        # https://github.com/github/super-linter/issues/2433
+        uses: super-linter/super-linter/slim@4ce20838b8ab83717e78138c5b3a1407148e0918 # v8.7.0
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_MARKDOWN: true
+          VALIDATE_PYTHON_FLAKE8: true
+          VALIDATE_YAML: true
+          VALIDATE_TERRAFORM_TFLINT: true
+          VALIDATE_BASH: true
+          VALIDATE_BASH_EXEC: true
+          VALIDATE_GITHUB_ACTIONS: true
+          VALIDATE_DOCKERFILE_HADOLINT: true
+
+      - name: Workspace Tags
+        uses: super-linter/super-linter/slim@4ce20838b8ab83717e78138c5b3a1407148e0918 # v8.7.0
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_TERRAFORM_TFLINT: true
+          TERRAFORM_TFLINT_CONFIG_FILE: .tflint_workspaces.hcl
+          FILTER_REGEX_INCLUDE: "./templates/workspaces/.*"
+
+      - name: Workspace Services Tags
+        uses: super-linter/super-linter/slim@4ce20838b8ab83717e78138c5b3a1407148e0918 # v8.7.0
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_TERRAFORM_TFLINT: true
+          TERRAFORM_TFLINT_CONFIG_FILE: .tflint_workspace_services.hcl
+          FILTER_REGEX_INCLUDE: "./templates/workspaces/.*"
+          FILTER_REGEX_EXCLUDE: ".*user_resource.*"
+
+      - name: User Resources Tags
+        uses: super-linter/super-linter/slim@4ce20838b8ab83717e78138c5b3a1407148e0918 # v8.7.0
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_TERRAFORM_TFLINT: true
+          TERRAFORM_TFLINT_CONFIG_FILE: .tflint_user_resources.hcl
+          FILTER_REGEX_INCLUDE: "./templates/workspace_services/.*/user_resources/.*"
+
+      - name: Shared Services Tags
+        uses: super-linter/super-linter/slim@4ce20838b8ab83717e78138c5b3a1407148e0918 # v8.7.0
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_TERRAFORM_TFLINT: true
+          TERRAFORM_TFLINT_CONFIG_FILE: .tflint_shared_services.hcl
+          FILTER_REGEX_INCLUDE: "./templates/shared_services/.*"
