@@ -2,10 +2,12 @@
 name: Build Validation
 
 on: # yamllint disable-line rule:truthy
-  pull_request:
-    branches:
-      - main
-      - "feature/**"
+  workflow_dispatch:
+  # Disabled all automatic triggers for this repo
+  # pull_request:
+  #   branches:
+  #     - main
+  #     - "feature/**"
 
 # for each ref (branch/pr) run just the most recent,
 # cancel other pending/running ones
